@@ -15,7 +15,7 @@ typedef struct {
     FARPROC(WINAPI* getProcAddress)(HMODULE, PCSTR);
     VOID(WINAPI* rtlZeroMemory)(PVOID, SIZE_T);
 
-    DWORD imageBase;
+    ULONGLONG imageBase;
     DWORD relocVirtualAddress;
     DWORD importVirtualAddress;
     DWORD addressOfEntryPoint;
@@ -24,12 +24,15 @@ typedef struct {
 DWORD WINAPI loadLibrary(LoaderData* loaderData)
 {
     PIMAGE_BASE_RELOCATION relocation = (PIMAGE_BASE_RELOCATION)(loaderData->baseAddress + loaderData->relocVirtualAddress);
-    DWORD delta = (DWORD)(loaderData->baseAddress - loaderData->imageBase);
+    ULONGLONG delta = (ULONGLONG)(loaderData->baseAddress - loaderData->imageBase);
     while (relocation->VirtualAddress) {
         PWORD relocationInfo = (PWORD)(relocation + 1);
-        for (int i = 0, count = (relocation->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD); i < count; i++)
-            if (relocationInfo[i] >> 12 == IMAGE_REL_BASED_HIGHLOW)
-                * (PDWORD)(loaderData->baseAddress + (relocation->VirtualAddress + (relocationInfo[i] & 0xFFF))) += delta;
+        for (int i = 0, count = (relocation->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD); i < count; i++) {
+            if (relocationInfo[i] >> 12 == IMAGE_REL_BASED_DIR64)
+                * (PULONGLONG)(loaderData->baseAddress + (relocation->VirtualAddress + (relocationInfo[i] & 0xFFF))) += delta;
+            else if (relocationInfo[i] >> 12 == IMAGE_REL_BASED_HIGHLOW)
+                * (PDWORD)(loaderData->baseAddress + (relocation->VirtualAddress + (relocationInfo[i] & 0xFFF))) += (DWORD)delta;
+        }
 
         relocation = (PIMAGE_BASE_RELOCATION)((LPBYTE)relocation + relocation->SizeOfBlock);
     }
@@ -46,7 +49,7 @@ DWORD WINAPI loadLibrary(LoaderData* loaderData)
             return FALSE;
 
         while (originalFirstThunk->u1.AddressOfData) {
-            DWORD Function = (DWORD)loaderData->getProcAddress(module, originalFirstThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG ? (LPCSTR)(originalFirstThunk->u1.Ordinal & 0xFFFF) : ((PIMAGE_IMPORT_BY_NAME)((LPBYTE)loaderData->baseAddress + originalFirstThunk->u1.AddressOfData))->Name);
+            ULONGLONG Function = (ULONGLONG)loaderData->getProcAddress(module, IMAGE_SNAP_BY_ORDINAL(originalFirstThunk->u1.Ordinal) ? (LPCSTR)IMAGE_ORDINAL(originalFirstThunk->u1.Ordinal) : ((PIMAGE_IMPORT_BY_NAME)((LPBYTE)loaderData->baseAddress + originalFirstThunk->u1.AddressOfData))->Name);
 
             if (!Function)
                 return FALSE;
@@ -59,9 +62,9 @@ DWORD WINAPI loadLibrary(LoaderData* loaderData)
     }
 
     if (loaderData->addressOfEntryPoint) {
-        DWORD result = ((DWORD(__stdcall*)(HMODULE, DWORD, LPVOID))
-            (loaderData->baseAddress + loaderData->addressOfEntryPoint))
-            ((HMODULE)loaderData->baseAddress, DLL_PROCESS_ATTACH, NULL);
+        typedef BOOL (WINAPI* DllMain)(HMODULE, DWORD, LPVOID);
+        DllMain entryPoint = (DllMain)(loaderData->baseAddress + loaderData->addressOfEntryPoint);
+        BOOL result = entryPoint((HMODULE)loaderData->baseAddress, DLL_PROCESS_ATTACH, NULL);
 
 #if ERASE_ENTRY_POINT
         loaderData->rtlZeroMemory(loaderData->baseAddress + loaderData->addressOfEntryPoint, 32);
@@ -161,8 +164,7 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 loaderParams.baseAddress = executableImage;
                 loaderParams.loadLibraryA = LoadLibraryA;
                 loaderParams.getProcAddress = GetProcAddress;
-                VOID (NTAPI RtlZeroMemory)(VOID* Destination, SIZE_T Length);
-                loaderParams.rtlZeroMemory = RtlZeroMemory;
+                loaderParams.rtlZeroMemory = (VOID(WINAPI*)(PVOID, SIZE_T))GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlZeroMemory");
                 loaderParams.imageBase = ntHeaders->OptionalHeader.ImageBase;
                 loaderParams.relocVirtualAddress = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
                 loaderParams.importVirtualAddress = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
@@ -171,7 +173,7 @@ INT WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 WriteProcessMemory(processInfo.hProcess, loaderMemory, &loaderParams, sizeof(LoaderData),
                     NULL);
                 WriteProcessMemory(processInfo.hProcess, loaderMemory + 1, loadLibrary,
-                    (DWORD)stub - (DWORD)loadLibrary, NULL);
+                    (uintptr_t)stub - (uintptr_t)loadLibrary, NULL);
                 HANDLE thread = CreateRemoteThread(processInfo.hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)(loaderMemory + 1),
                     loaderMemory, 0, NULL);
 
